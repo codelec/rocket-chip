@@ -126,7 +126,7 @@ trait HasTileInterruptSources
   /** Source of Non-maskable Interrupt (NMI) input bundle to each tile. */
   val tileNMINode = BundleBridgeEphemeralNode[NMI]()
   val tileNMIIONodes: Seq[BundleBridgeSource[NMI]] = {
-    Seq.fill(tiles.size) {
+    Seq.fill(1) {
       val nmiSource = BundleBridgeSource[NMI]()
       tileNMINode := nmiSource
       nmiSource
@@ -159,10 +159,10 @@ trait HasTileInputConstants extends InstantiatesTiles { this: BaseSubsystem =>
   val tileHartIdNexusNode = LazyModule(new BundleBridgeNexus[UInt](
     inputFn = BundleBridgeNexus.orReduction[UInt](registered = p(InsertTimingClosureRegistersOnHartIds)) _,
     outputFn = (prefix: UInt, n: Int) =>  Seq.tabulate(n) { i =>
-      val y = dontTouch(prefix | hartIdList(i).U(p(MaxHartIdBits).W)) // dontTouch to keep constant prop from breaking tile dedup
+      val y = dontTouch(prefix | hartIdList(i).U(log2Ceil(hartIdList.size).W)) // dontTouch to keep constant prop from breaking tile dedup
       if (p(InsertTimingClosureRegistersOnHartIds)) BundleBridgeNexus.safeRegNext(y) else y
     },
-    default = Some(() => 0.U(p(MaxHartIdBits).W)),
+    default = Some(() => 0.U(log2Ceil(hartIdList.size). W)),
     inputRequiresOutput = true, // guard against this being driven but then ignored in tileHartIdIONodes below
     shouldBeInlined = false // can't inline something whose output we are are dontTouching
   )).node
@@ -265,13 +265,14 @@ trait CanAttachTile {
     connectInputConstants(domain, context)
     LogicalModuleTree.add(context.logicalTreeNode, domain.tile.logicalTreeNode)
   }
-
+  
   /** Connect the port where the tile is the master to a TileLink interconnect. */
   def connectMasterPorts(domain: TilePRCIDomain[TileType], context: Attachable): Unit = {
     implicit val p = context.p
     val dataBus = context.locateTLBusWrapper(crossingParams.master.where)
+    domain.crossMasterPort(NoCrossing)
     dataBus.coupleFrom(tileParams.name.getOrElse("tile")) { bus =>
-      bus :=* crossingParams.master.injectNode(context) :=* domain.crossMasterPort(crossingParams.crossingType)
+      bus :=* crossingParams.master.injectNode(context) :=* domain.iden //crossMasterPort(NoCrossing)
     }
   }
 
@@ -280,8 +281,9 @@ trait CanAttachTile {
     implicit val p = context.p
     DisableMonitors { implicit p =>
       val controlBus = context.locateTLBusWrapper(crossingParams.slave.where)
+      domain.crossSlavePort(NoCrossing)
       controlBus.coupleTo(tileParams.name.getOrElse("tile")) { bus =>
-        domain.crossSlavePort(crossingParams.crossingType) :*= crossingParams.slave.injectNode(context) :*= TLWidthWidget(controlBus.beatBytes) :*= bus
+        domain.idenslv :*= crossingParams.slave.injectNode(context) :*= TLWidthWidget(controlBus.beatBytes) :*= bus
       }
     }
   }
@@ -296,25 +298,25 @@ trait CanAttachTile {
     // 1. Debug interrupt is definitely asynchronous in all cases.
     domain.tile.intInwardNode :=
       context.debugOpt
-        .map { domain { IntSyncAsyncCrossingSink(3) } := _.intnode }
+        .map { IntSyncAsyncCrossingSink(3) := _.intnode }
         .getOrElse { NullIntSource() }
 
     // 2. The CLINT and PLIC output interrupts are synchronous to the TileLink bus clock,
     //    so might need to be synchronized depending on the Tile's crossing type.
 
     //    From CLINT: "msip" and "mtip"
-    domain.crossIntIn(crossingParams.crossingType) :=
+    domain.tile.intInwardNode :=
       context.clintOpt.map { _.intnode }
         .getOrElse { NullIntSource(sources = CLINTConsts.ints) }
 
     //    From PLIC: "meip"
-    domain.crossIntIn(crossingParams.crossingType) :=
+    domain.tile.intInwardNode :=
       context.plicOpt .map { _.intnode }
         .getOrElse { context.meipNode.get }
 
     //    From PLIC: "seip" (only if supervisor mode is enabled)
     if (domain.tile.tileParams.core.hasSupervisorMode) {
-      domain.crossIntIn(crossingParams.crossingType) :=
+      domain.tile.intInwardNode :=
         context.plicOpt .map { _.intnode }
           .getOrElse { context.seipNode.get }
     }
@@ -374,6 +376,79 @@ trait CanAttachTile {
       domain.tile_reset_domain.clockNode := crossingParams.resetCrossingType.injectClockNode := domain.clockNode
     } := clockSource
   }
+  def connectclo(clo: CloneLazyModule, domain: TilePRCIDomain[TileType], context: TileContextType): Unit = {
+    implicit val p = context.p
+    clo.clone(NodeHandle(domain.tile.hartIdNode, TLTempNode()))(ValName("hh")) := context.tileHartIdNode
+    val dataBus = context.locateTLBusWrapper(crossingParams.master.where)
+    val idee = TLIdentityNode()
+    idee := clo.clone(NodeHandle(TLTempNode(), domain.iden))(ValName("imp"))
+    dataBus.coupleFrom("tile1") { bus =>
+      bus := crossingParams.master.injectNode(context) := idee // clo.clone(NodeHandle(TLTempNode(), domain.iden))(ValName("imp"))
+    }
+    val ideee = TLIdentityNode()
+    clo.clone(NodeHandle(domain.idenslv, TLTempNode()))(ValName("impslv")) :*= ideee
+    DisableMonitors { implicit p =>
+      val controlBus = context.locateTLBusWrapper(crossingParams.slave.where)
+      controlBus.coupleTo(tileParams.name.getOrElse("tile")) { bus =>
+        ideee :*= crossingParams.slave.injectNode(context) :*= TLWidthWidget(controlBus.beatBytes) :*= bus
+      }
+    }
+    //val intclo = clo.clone(NodeHandle(domain.intiden, TLTempNode()))
+    val intclo = clo.clone(NodeHandle(domain.tile.intInwardNode, TLTempNode()))
+    intclo := 
+      context.debugOpt//.get.intnode
+        .map { IntSyncAsyncCrossingSink(3) := _.intnode }
+        .getOrElse { NullIntSource() }
+    
+    
+    //intclo := NullIntSource()
+    //intclo := NullIntSource()
+    //intclo := NullIntSource()
+    intclo := 
+      context.clintOpt.map { _.intnode }
+        .getOrElse { NullIntSource(sources = CLINTConsts.ints) }
+    intclo :=
+      context.plicOpt .map { _.intnode }
+        .getOrElse { context.meipNode.get }
+    if (domain.tile.tileParams.core.hasSupervisorMode) {
+      intclo :=
+        context.plicOpt .map { _.intnode }
+          .getOrElse { context.seipNode.get }
+    }
+    context.plicOpt.foreach { plic =>
+      FlipRendering { implicit p =>
+        plic.intnode :=* clo.clone(NodeHandle(TLTempNode(), domain.tile.intOutwardNode))(ValName("hho"))
+      }
+    }
+    clo.clone(NodeHandle(domain.tile.nmiNode, TLTempNode()))(ValName("hhoo")) := context.tileNMINode
+    clo.clone(NodeHandle(domain.tile.resetVectorNode, TLTempNode()))(ValName("hhmo")) := context.tileResetVectorNode
+    val tlBusToGetClockDriverFrom = context.locateTLBusWrapper(crossingParams.master.where)
+    val clockSource = (crossingParams.crossingType match {
+      case _: SynchronousCrossing | _: CreditedCrossing =>
+        if (crossingParams.forceSeparateClockReset) tlBusToGetClockDriverFrom.clockNode
+        else tlBusToGetClockDriverFrom.fixedClockNode
+      case _: RationalCrossing => tlBusToGetClockDriverFrom.clockNode
+      case _: AsynchronousCrossing => {
+        val tileClockGroup = ClockGroup()
+        tileClockGroup := context.asyncClockGroupsNode
+        tileClockGroup
+      }
+    })
+
+    //domain {
+      //clo.clone(domain.tile_reset_domain.clockNode)(ValName("hhco")) := crossingParams.resetCrossingType.injectClockNode := 
+    clo.clone(NodeHandle(domain.clockNode, TLTempNode()))(ValName("hhco")) := clockSource
+    /*
+    context.tileHaltXbarNode  :=* clo.clone(NodeHandle(TLTempNode(), domain.tile.haltNode))(ValName("hhoi"))
+    context.tileWFIXbarNode   :=* clo.clone(domain.crossIntOut(NoCrossing, domain.tile.wfiNode)
+    context.tileCeaseXbarNode :=* clo.clone(domain.crossIntOut(NoCrossing, domain.tile.ceaseNode)
+    domain.crossTracesOut()
+    val tlBusToGetPrefixFrom = context.locateTLBusWrapper(crossingParams.mmioBaseAddressPrefixWhere)
+    tlBusToGetPrefixFrom.prefixNode.foreach { clo.clone(domain.tile.mmioAddressPrefixNode := _ }
+    val tlBusToGetClockDriverFrom = context.locateTLBusWrapper(crossingParams.master.where)
+    
+    LogicalModuleTree.add(context.logicalTreeNode, domain.tile.logicalTreeNode)*/
+  }
 }
 
 /** InstantiatesTiles adds a Config-urable sequence of tiles of any type
@@ -395,10 +470,10 @@ trait InstantiatesTiles { this: BaseSubsystem =>
   val tileParams: Seq[TileParams] = tileAttachParams.map(_.tileParams)
   val tileCrossingTypes: Seq[ClockCrossingType] = tileAttachParams.map(_.crossingParams.crossingType)
   def nTiles: Int = tileAttachParams.size
-  def hartIdList: Seq[Int] = tileParams.map(_.hartId)
+  def hartIdList: Seq[Int] = tileParams.map(_.hartId) ++ Seq(1,2,3,4,5,6,7)
   def localIntCounts: Seq[Int] = tileParams.map(_.core.nLocalInterrupts)
 
-  require(hartIdList.distinct.size == tiles.size, s"Every tile must be statically assigned a unique id, but got:\n${hartIdList}")
+  //require(hartIdList.distinct.size == tiles.size, s"Every tile must be statically assigned a unique id, but got:\n${hartIdList}")
 }
 
 /** HasTiles instantiates and also connects a Config-urable sequence of tiles of any type to subsystem interconnect resources. */
@@ -410,6 +485,15 @@ trait HasTiles extends InstantiatesTiles with HasCoreMonitorBundles with Default
   tileAttachParams.zip(tile_prci_domains).foreach { case (params, td) =>
     params.connect(td.asInstanceOf[TilePRCIDomain[params.TileType]], this.asInstanceOf[params.TileContextType])
   }
+  
+  //val clo = CloneLazyModule(tile_prci_domains(0))
+  //val mmo = CloneLazyModule(tile_prci_domains(0))
+  //val para = tileAttachParams(0)
+  //context.tileHaltXbarNode  :=* clo.clone(domain.crossIntOut(NoCrossing, domain.tile.haltNode)
+  //clo.clone(NodeHandle(tile_prci_domains(0).asInstanceOf[TilePRCIDomain[para.TileType]].tile.hartIdNode, TLTempNode()))(ValName("hh")) := this.tileHartIdNode
+  //para.connectclo(clo, tile_prci_domains(0).asInstanceOf[TilePRCIDomain[para.TileType]], this.asInstanceOf[para.TileContextType])
+  //para.connectclo(mmo, tile_prci_domains(0).asInstanceOf[TilePRCIDomain[para.TileType]], this.asInstanceOf[para.TileContextType])
+  //Seq.fill(7)(CloneLazyModule(tile_prci_domains(0))).foreach(para.connectclo(_, tile_prci_domains(0).asInstanceOf[TilePRCIDomain[para.TileType]], this.asInstanceOf[para.TileContextType]))
 }
 
 /** Provides some Chisel connectivity to certain tile IOs */

@@ -42,8 +42,11 @@ abstract class TilePRCIDomain[T <: BaseTile](
     extends ClockDomain
 {
   val tile: T
-  val tile_reset_domain = LazyModule(new TileResetDomain(clockSinkParams, crossingParams.resetCrossingType))
+  val tile_reset_domain = LazyModule(new TileResetDomain(clockSinkParams, NoResetCrossing()))
   val tapClockNode = ClockIdentityNode()
+  val iden = TLIdentityNode()
+  val idenslv = TLIdentityNode()
+//  val intiden = IntIdentityNode()
   val clockNode = FixedClockBroadcast(None) :=* tapClockNode
   lazy val clockBundle = tapClockNode.in.head._1
 
@@ -70,8 +73,9 @@ abstract class TilePRCIDomain[T <: BaseTile](
   /** External code looking to connect and clock-cross the interrupts driven into this tile can call this. */
   def crossIntIn(crossingType: ClockCrossingType): IntInwardNode = {
     // Unlike the other crossing helpers, here nothing is is blocked during reset because we know these are inputs and assume that tile reset is longer than uncore reset
-    val intInClockXing = this.crossIn(tile.intInwardNode)
-    intInClockXing(crossingType)
+    //val intInClockXing = this.crossIn(tile.intInwardNode)
+    //this { intInClockXing(crossingType) := intiden }
+    tile.intInwardNode
   }
 
   /** External code looking to connect and clock/reset-cross
@@ -95,8 +99,8 @@ abstract class TilePRCIDomain[T <: BaseTile](
       tile_reset_domain.crossTLIn(tile.slaveNode) :*=
         tile.makeSlaveBoundaryBuffers(crossingType)
     }
-    val tlSlaveClockXing = this.crossIn(tlSlaveResetXing)
-    tlSlaveClockXing(crossingType)
+    this { val tlSlaveClockXing = this.crossIn(tlSlaveResetXing)
+    tlSlaveClockXing(crossingType) :*= idenslv }
   } } }
 
   /** External code looking to connect the ports where this tile masters an interconnect
@@ -104,10 +108,10 @@ abstract class TilePRCIDomain[T <: BaseTile](
     */
   def crossMasterPort(crossingType: ClockCrossingType): TLOutwardNode = {
     val tlMasterResetXing = this { DisableMonitors { implicit p =>
-      tile.makeMasterBoundaryBuffers(crossingType) :=*
+      tile.makeMasterBoundaryBuffers(NoCrossing) :=*
         tile_reset_domain.crossTLOut(tile.masterNode)
     } }
-    val tlMasterClockXing = this.crossOut(tlMasterResetXing)
-    tlMasterClockXing(crossingType)
+    this { val tlMasterClockXing = this.crossOut(tlMasterResetXing)
+    iden := tlMasterClockXing(crossingType) }
   }
 }
